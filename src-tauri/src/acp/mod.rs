@@ -1,4 +1,4 @@
 pub mod connection;
 pub mod protocol;
 
-pub use connection::{AcpConnection, AcpError, InboundHandler};
+pub use connection::{AcpConnection, InboundHandler};
