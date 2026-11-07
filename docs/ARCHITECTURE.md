@@ -34,7 +34,7 @@ flowchart LR
       C[Rust core<br/>panel ctl, settings,<br/>ACP client, cleanup]
     end
     K[kiro-cli acp<br/>child process]
-    FS[~/.kiro/sessions<br/>~/.kiro/session-index<br/>App Support/kiro-cli/data.sqlite3]
+    FS[~/.kiro/sessions/cwdHash<br/>~/.kiro/session-index/cwdHash.jsonl]
   end
   Cloud[Kiro service<br/>models, auth]
   MCP[MCP servers from<br/>~/.kiro/settings/mcp.json]
@@ -79,9 +79,9 @@ src-tauri/
 
 Responsibilities:
 
-- **panel.rs**: converts the main `WebviewWindow` to an `NSPanel` with `nonactivatingPanel` style, level `NSFloatingWindowLevel`, collection behaviour `canJoinAllSpaces | fullScreenAuxiliary | moveToActiveSpace`. Centres horizontally at ~22% from the top of the screen with the mouse cursor. Hides on Esc, on hotkey toggle, and on `resignKey` (click outside) unless a permission prompt is pending.
+- **panel.rs**: converts the main `WebviewWindow` to an `NSPanel` with `nonactivatingPanel` style, level `NSFloatingWindowLevel`, collection behaviour `fullScreenAuxiliary | moveToActiveSpace`. Centres horizontally at ~22% from the top of the screen with the mouse cursor. Hides on Esc (and ends the conversation), on hotkey toggle, and on `resignKey` (click outside, conversation kept).
 - **acp/process.rs**: one child `kiro-cli acp --agent kiro-spotlight [--model M] [--effort E] [--trust-tools ...]` per app run (not per panel open) to keep latency low. Restarts it on crash with exponential backoff. stdout is read line by line; stderr goes to the app log.
-- **acp/client.rs**: `initialize` on start; `session/new` per panel open; `session/prompt` per message; `session/cancel` on stop. Dispatches `session/update` notifications to the UI as Tauri events. Answers agent-to-client requests: `session/request_permission` (routed to UI), `fs/read_text_file` and `fs/write_text_file` (allowed only under the temp cwd), `terminal/*` (declined in v1; capability not advertised).
+- **acp/client.rs**: `initialize` on start; `session/new` per panel open; `session/prompt` per message; `session/cancel` on stop. Dispatches `session/update` notifications to the UI as Tauri events. Answers agent-to-client requests: `session/request_permission` (routed to UI); anything else, including `fs/*` and `terminal/*`, gets `-32601` because neither capability is advertised. Kiro extension notifications (`_kiro/*`) are ignored.
 - **session.rs**: see section 7.
 - **settings.rs**: JSON at `~/Library/Application Support/kiro-spotlight/settings.json`. Nothing conversational is ever stored here.
 
@@ -203,7 +203,7 @@ The panel uses whatever theme the user picked in Kiro and switches live when the
 3. Load the referenced theme JSON (JSONC, may use `include` to chain a parent theme; follow it). `uiTheme` gives the kind: `vs` = light, `vs-dark` = dark, `hc-*` = high contrast.
 4. Read the `colors` map. Missing tokens fall back to the VS Code defaults for that kind.
 
-**Kiro Crew lookup** (`kiro_crew.rs`): a built-in table maps each Kiro Crew `theme_color` id to a light and a dark palette (Rosé Pine to Dawn/Main, and so on). `theme_mode: system` follows macOS appearance. Unknown ids fall through to macOS.
+**Kiro Crew lookup** (`kiro_crew.rs`): Kiro Crew defines each theme as CSS variables under `[data-theme=<theme_color>-light]` and `[data-theme=<theme_color>-dark]` in its dashboard stylesheet (`KiroCrew.app/.../kiro_crew/static/dist/assets/*.css`). The app reads those two blocks for the configured `theme_color` and maps `--bg`, `--text`, `--muted`, `--accent`, `--accent-fg`, `--border`, `--danger`, `--bg-elevated` onto its own variables. `theme_mode: system` sends both palettes and the UI picks one with `prefers-color-scheme`. A missing app or theme id falls through to macOS.
 
 **Token mapping** (`palette.rs`), VS Code token to CSS variable:
 
@@ -231,23 +231,25 @@ Colours with alpha (e.g. `#6e6a8614`, `#0000`) are composited over `--bg` before
 
 ## 7. Incognito guarantees
 
-What kiro-cli writes on disk per session (observed on kiro-cli 3.1.0):
+What kiro-cli writes on disk per ACP session (probed on kiro-cli 3.1.0, 2026-11-07, one `session/new` + one `session/prompt`):
 
-- `~/.kiro/sessions/<sessionId>/` (transcript and state)
-- `~/.kiro/session-index/<sessionId>.jsonl`
-- `~/Library/Application Support/kiro-cli/data.sqlite3` (conversation and history tables; exact schema to be confirmed in M1)
-- `~/Library/Application Support/kiro-cli/history` (shell history for the TUI; not touched by ACP, verify)
+- `~/.kiro/sessions/<cwdHash>/<sessionId>/messages.jsonl` and `session.json` (transcript and state). `<cwdHash>` is a 16-hex-char hash of the session cwd.
+- `~/.kiro/sessions/<cwdHash>/.index/` (lock directory)
+- `~/.kiro/session-index/<cwdHash>.jsonl` (append-only `add` / `remove` records holding only the session path and a timestamp)
+- `~/Library/Application Support/kiro-cli/data.sqlite3` is touched, but none of its tables (`conversations`, `conversations_v2`, `history`, `state`) contained the session id. ACP sessions do not land there.
+
+`initialize` advertises `sessionCapabilities.delete`. Calling `session/delete {sessionId}` removed the `<sessionId>/` directory and appended a `remove` record to the index, leaving only `.index/` and the two index lines. The `session/new` result also reported `memoryConfig.mode: "disabled"`.
 
 Policy:
 
-1. **Isolated cwd**: each panel session runs in `mkdtemp()` under `$TMPDIR/kiro-spotlight/`. The agent's `--resume` lookups key on cwd, so nothing from the user's repos is resumed, and nothing the agent writes by default lands in a real project.
+1. **Isolated cwd**: each panel session runs in a fresh directory under `$TMPDIR/kiro-spotlight/`. Because `<cwdHash>` is derived from the cwd, every Spotlight session gets its own `<cwdHash>` that no other kiro-cli session shares, so its leftovers can be removed wholesale.
 2. **In-memory transcript only**: the UI keeps the transcript in component state; no localStorage, no IndexedDB, no Tauri store. The webview is created with `incognito: true` so WebKit uses a non-persistent data store.
-3. **Cleanup on dismiss** (`cleanup.rs`), run after `session/cancel` completes or the turn ends:
-   - delete `~/.kiro/sessions/<sessionId>/` and `~/.kiro/session-index/<sessionId>.jsonl`;
-   - delete rows for `<sessionId>` in `data.sqlite3` (tables identified in M1; use `rusqlite` with `busy_timeout`, since kiro-cli may hold the DB);
+3. **Cleanup** (`session.rs`), run when a conversation ends:
+   - send `session/cancel` if a turn is running, then `session/delete`;
+   - delete `~/.kiro/sessions/<cwdHash>/` and `~/.kiro/session-index/<cwdHash>.jsonl`, but only after checking that they reference no session other than ours;
    - remove the temp cwd;
    - zero the in-memory transcript.
-   If `kiro-cli` exposes `session/delete` (ACP v2 draft), call it first and fall back to file deletion.
+   A conversation ends on Esc, Cmd+K (new chat), app quit, or after the panel has been hidden for 10 minutes. Clicking outside only hides the panel, so a stray click does not wipe the chat.
 4. **Cleanup on crash**: at launch, delete any leftover `$TMPDIR/kiro-spotlight/*` and any session ids recorded in `~/Library/Application Support/kiro-spotlight/pending-cleanup.json` (written before `session/new`, cleared after cleanup).
 5. **Clipboard**: copying an answer is a user action and is allowed; the app never writes the clipboard on its own.
 6. **Logs**: app log at `~/Library/Logs/kiro-spotlight/` records protocol method names and timings only, never message bodies. Log level `debug` (bodies included) is opt-in and shows a persistent banner in the panel.
@@ -256,7 +258,7 @@ Policy:
 ## 8. Permissions and security
 
 - Agent runs with `allowedTools` limited to read-only tools; `execute_bash`, `fs_write` and MCP tools prompt via `session/request_permission` every time unless the user picks "Allow for this session" (held in memory, cleared at cleanup).
-- Client-side `fs/read_text_file` and `fs/write_text_file` requests are honoured only for paths under the session temp cwd; anything else returns a JSON-RPC error so the agent falls back to its own tools (which prompt).
+- The client advertises no `fs` capability, so the agent uses its own file tools, which go through the permission card. Any `fs/*` request that arrives anyway is answered with JSON-RPC error `-32601`.
 - `terminal/*` client capability is not advertised in v1.
 - The agent's streamed text is Markdown rendered through DOMPurify; links open in the default browser via `tauri-plugin-opener`, never inside the webview.
 - Tauri capability file grants only: `core:window`, `global-shortcut`, `opener`, `clipboard-manager:write`, and the app's own commands. No `shell` plugin in the frontend; only Rust spawns `kiro-cli`.
@@ -290,7 +292,7 @@ hotkey, agent name (default `kiro-spotlight`), model, effort, engine (v2/v3), th
 | M | Scope | Exit criteria |
 |---|---|---|
 | M0 | Spike | Hotkey toggles an NSPanel with vibrancy over a fullscreen app; `kiro-cli acp` answers one `session/prompt` from Rust and streams to the webview |
-| M1 | Incognito | Confirm which files and `data.sqlite3` tables kiro-cli writes under ACP; cleanup deletes them; test proves nothing remains |
+| M1 | Incognito | `session/delete` plus per-cwd-hash sweep; crash recovery; test proves nothing remains |
 | M2 | Chat UX | Markdown streaming, tool-call rows, permission card, Stop, Cmd+K, error states |
 | M3 | Native polish + Kiro theme | Kiro theme resolution and live reload, shiki theme from `tokenColors`, SF Symbols, animations, menu bar, settings, hotkey recorder |
 | M4 | Ship | Sign, notarise, DMG, launch-at-login, crash cleanup |
@@ -298,7 +300,7 @@ hotkey, agent name (default `kiro-spotlight`), model, effort, engine (v2/v3), th
 ## 13. Open questions
 
 1. Does `kiro-cli acp` honour a per-session `--agent` other than at process start? If not, changing the agent in settings restarts the child (acceptable).
-2. Does kiro-cli 3.1.0 implement ACP `session/delete`? If yes, M1 cleanup becomes a protocol call plus a verification sweep.
+2. Resolved: kiro-cli 3.1.0 implements `session/delete` (see section 7).
 3. Should "Allow for this session" also cover MCP tools from `mcp.json`, or only built-ins? Default proposal: built-ins only.
 4. Whether to support v3 engine `--auth-method client` in v1 (the app would have to answer access-token requests). Proposal: no.
 
