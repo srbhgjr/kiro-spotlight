@@ -43,7 +43,6 @@ pub fn read_selection(settings: &Value) -> Option<Selection> {
 
 #[derive(Debug, Clone)]
 pub struct IdeTheme {
-    pub label: String,
     pub kind: Kind,
     pub colors: HashMap<String, String>,
 }
@@ -69,7 +68,7 @@ fn theme_in_extension(ext: &Path, name: &str) -> Option<IdeTheme> {
     let path = ext.join(entry.get("path")?.as_str()?);
     let kind = kind_of(entry.get("uiTheme").and_then(Value::as_str).unwrap_or("vs-dark"));
     let colors = load_colors(&path, 0);
-    Some(IdeTheme { label: name.to_string(), kind, colors })
+    Some(IdeTheme { kind, colors })
 }
 
 fn theme_matches(entry: &Value, name: &str, nls: &Value) -> bool {

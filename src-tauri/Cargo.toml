@@ -26,6 +26,10 @@ thiserror = "2"
 [dev-dependencies]
 tempfile = "3"
 
+[lints.clippy]
+cognitive_complexity = "warn"
+too_many_lines = "warn"
+
 [profile.release]
 codegen-units = 1
 lto = true
