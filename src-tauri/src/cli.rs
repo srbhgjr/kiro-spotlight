@@ -1,4 +1,4 @@
-//! Locating `kiro-cli` and preparing the environment and agent profile it runs with.
+//! Locating `kiro-cli` and preparing the environment and session options it runs with.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -8,7 +8,6 @@ use std::time::Duration;
 use serde_json::{json, Value};
 use tokio::process::Command;
 
-pub const AGENT_NAME: &str = "kiro-spotlight";
 const PATH_MARK: &str = "__KIRO_SPOTLIGHT_PATH__";
 
 pub fn home() -> PathBuf {
@@ -62,38 +61,26 @@ fn extract_marked(text: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_string())
 }
 
-/// Write `~/.kiro/agents/kiro-spotlight.json` if it does not exist. An existing file is never touched.
-pub fn ensure_agent_profile() -> std::io::Result<PathBuf> {
-    let dir = home().join(".kiro").join("agents");
-    let path = dir.join(format!("{AGENT_NAME}.json"));
-    if path.exists() {
-        return Ok(path);
-    }
-    std::fs::create_dir_all(&dir)?;
-    let body = serde_json::to_string_pretty(&agent_profile()).unwrap_or_default();
-    std::fs::write(&path, body)?;
-    Ok(path)
+/// `kiro-cli acp` with no `--agent`: a custom agent selects an engine without `session/delete`.
+pub fn agent_args() -> Vec<String> {
+    vec!["acp".to_string()]
 }
 
-pub fn agent_profile() -> Value {
-    json!({
-        "name": AGENT_NAME,
-        "description": "Kiro Spotlight quick chat. Read-only tools run without asking; everything else asks.",
-        "prompt": "You are Kiro, answering in a small quick-chat panel on macOS. Keep answers short and direct, use Markdown, and prefer a code block over prose for commands. This conversation is incognito and is deleted when the panel closes.",
-        "tools": ["*"],
-        "allowedTools": ["fs_read", "grep", "glob", "web_fetch", "web_search"],
-        "resources": [],
-        "includeMcpJson": true
-    })
-}
-
-pub fn agent_args(model: Option<&str>) -> Vec<String> {
-    let mut args = vec!["acp".to_string(), "--agent".to_string(), AGENT_NAME.to_string()];
+/// Per-session options applied right after `session/new`, in order.
+///
+/// `autopilot: off` makes kiro-cli ask through `session/request_permission` before running
+/// commands or writing files; `contentCollection` and `memoryReflection` are switched off so
+/// the conversation is not used for content collection or written into Kiro memory.
+pub fn session_options(model: Option<&str>) -> Vec<(&'static str, Value)> {
+    let mut options = vec![
+        ("autopilot", json!("off")),
+        ("contentCollection", json!("disabled")),
+        ("memoryReflection", json!("off")),
+    ];
     if let Some(model) = model.filter(|m| !m.is_empty()) {
-        args.push("--model".into());
-        args.push(model.into());
+        options.push(("model", json!(model)));
     }
-    args
+    options
 }
 
 #[cfg(test)]
@@ -121,23 +108,17 @@ mod tests {
     }
 
     #[test]
-    fn agent_args_include_model_only_when_set() {
-        assert_eq!(agent_args(None), vec!["acp", "--agent", AGENT_NAME]);
-        assert_eq!(agent_args(Some("")).len(), 3);
-        assert_eq!(agent_args(Some("auto")).last().map(String::as_str), Some("auto"));
+    fn agent_never_selects_a_custom_agent() {
+        assert_eq!(agent_args(), vec!["acp"]);
     }
 
     #[test]
-    fn agent_profile_trusts_only_read_only_tools() {
-        let profile = agent_profile();
-        let allowed: Vec<&str> = profile["allowedTools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        assert!(!allowed.contains(&"execute_bash"));
-        assert!(!allowed.contains(&"fs_write"));
-        assert_eq!(profile["includeMcpJson"], true);
+    fn session_options_lock_down_autonomy_and_collection() {
+        let options = session_options(None);
+        let ids: Vec<&str> = options.iter().map(|(id, _)| *id).collect();
+        assert_eq!(ids, vec!["autopilot", "contentCollection", "memoryReflection"]);
+        assert_eq!(options[0].1, "off");
+        assert_eq!(session_options(Some("")).len(), 3);
+        assert_eq!(session_options(Some("claude-sonnet-5.5")).last().unwrap().1, "claude-sonnet-5.5");
     }
 }

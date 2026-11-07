@@ -34,6 +34,14 @@ pub trait InboundHandler: Send + Sync + 'static {
 
 type Pending = Mutex<HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>>;
 
+/// How to start the agent process.
+pub struct Spawn<'a> {
+    pub program: &'a Path,
+    pub args: &'a [String],
+    pub path_env: Option<&'a str>,
+    pub cwd: Option<&'a Path>,
+}
+
 pub struct AcpConnection {
     stdin: AsyncMutex<ChildStdin>,
     child: AsyncMutex<Child>,
@@ -44,20 +52,18 @@ pub struct AcpConnection {
 
 impl AcpConnection {
     /// Spawn the agent and start the stdout reader task.
-    pub fn spawn(
-        program: &Path,
-        args: &[String],
-        path_env: Option<&str>,
-        handler: Arc<dyn InboundHandler>,
-    ) -> Result<Arc<Self>, AcpError> {
-        let mut cmd = Command::new(program);
-        cmd.args(args)
+    pub fn spawn(spec: &Spawn<'_>, handler: Arc<dyn InboundHandler>) -> Result<Arc<Self>, AcpError> {
+        let mut cmd = Command::new(spec.program);
+        cmd.args(spec.args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
-        if let Some(path) = path_env {
+        if let Some(path) = spec.path_env {
             cmd.env("PATH", path);
+        }
+        if let Some(dir) = spec.cwd {
+            cmd.current_dir(dir);
         }
         let mut child = cmd.spawn().map_err(AcpError::Spawn)?;
         let stdin = child.stdin.take().ok_or(AcpError::Closed)?;
@@ -185,9 +191,14 @@ read line
 echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom"}}'
 "#;
 
+    fn spawn_sh(script: &str, handler: Arc<Recorder>) -> Arc<AcpConnection> {
+        let args = vec!["-c".to_string(), script.to_string()];
+        let spec = Spawn { program: Path::new("/bin/sh"), args: &args, path_env: None, cwd: None };
+        AcpConnection::spawn(&spec, handler).expect("spawn fake agent")
+    }
+
     fn spawn_fake(handler: Arc<Recorder>) -> Arc<AcpConnection> {
-        let args = vec!["-c".to_string(), FAKE_AGENT.to_string()];
-        AcpConnection::spawn(Path::new("/bin/sh"), &args, None, handler).expect("spawn fake agent")
+        spawn_sh(FAKE_AGENT, handler)
     }
 
     #[tokio::test]
@@ -208,8 +219,7 @@ echo '{"jsonrpc":"2.0","id":2,"error":{"code":-32000,"message":"boom"}}'
     #[tokio::test]
     async fn pending_requests_fail_when_agent_exits() {
         let recorder = Arc::new(Recorder::default());
-        let args = vec!["-c".to_string(), "read line".to_string()];
-        let conn = AcpConnection::spawn(Path::new("/bin/sh"), &args, None, recorder.clone()).unwrap();
+        let conn = spawn_sh("read line", recorder.clone());
 
         let outcome = conn.request("initialize", json!({})).await;
         assert!(matches!(outcome, Err(AcpError::Closed)));

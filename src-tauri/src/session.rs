@@ -11,7 +11,7 @@ use serde_json::{json, Value};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 
-use crate::acp::{protocol, AcpConnection, InboundHandler};
+use crate::acp::{protocol, AcpConnection, InboundHandler, Spawn};
 use crate::cleanup::{KiroStore, PendingSession, PendingStore, TempDirs};
 use crate::cli;
 use crate::settings::Settings;
@@ -195,11 +195,16 @@ impl SessionManager {
         let path_env = self.path_env.get_or_init(cli::login_shell_path).await.clone();
         let program = cli::locate(self.settings.cli_path.as_deref(), path_env.as_deref())
             .ok_or("kiro-cli was not found. Install it and run `kiro-cli login`.")?;
-        cli::ensure_agent_profile().map_err(|e| format!("could not write agent profile: {e}"))?;
-        let args = cli::agent_args(self.settings.model.as_deref());
+        let args = cli::agent_args();
+        std::fs::create_dir_all(&self.temp.base).map_err(|e| e.to_string())?;
         let handler = Arc::new(Bridge { app: self.app.clone() });
-        let conn = AcpConnection::spawn(&program, &args, path_env.as_deref(), handler)
-            .map_err(|e| e.to_string())?;
+        let spec = Spawn {
+            program: &program,
+            args: &args,
+            path_env: path_env.as_deref(),
+            cwd: Some(&self.temp.base),
+        };
+        let conn = AcpConnection::spawn(&spec, handler).map_err(|e| e.to_string())?;
         let init = conn
             .request("initialize", protocol::initialize_params(env!("CARGO_PKG_VERSION")))
             .await
@@ -223,7 +228,25 @@ impl SessionManager {
             .ok_or("session/new returned no sessionId")?
             .to_string();
         let _ = self.pending.add(PendingSession { session_id: id.clone(), cwd: cwd.clone() });
-        Ok(ActiveSession { id, cwd, cwd_hash: None })
+        let session = ActiveSession { id, cwd, cwd_hash: None };
+        if let Err(err) = self.configure(conn, &session.id).await {
+            self.delete_session(conn, &session.id, None).await;
+            let _ = self.temp.remove(&session.cwd);
+            let _ = self.pending.remove(&session.id);
+            return Err(err);
+        }
+        Ok(session)
+    }
+
+    /// Apply the incognito session options. A session that cannot be locked down is not used.
+    async fn configure(&self, conn: &AcpConnection, session_id: &str) -> Result<(), String> {
+        for (config_id, value) in cli::session_options(self.settings.model.as_deref()) {
+            let params = json!({ "sessionId": session_id, "configId": config_id, "value": value });
+            conn.request("session/set_config_option", params)
+                .await
+                .map_err(|e| format!("could not set {config_id}: {e}"))?;
+        }
+        Ok(())
     }
 
     async fn delete_session(&self, conn: &AcpConnection, session_id: &str, known_hash: Option<String>) {
