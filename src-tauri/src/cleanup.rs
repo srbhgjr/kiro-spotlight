@@ -200,7 +200,7 @@ mod tests {
     use super::*;
 
     const HASH: &str = "a04ff4a97e5affac";
-    const SID: &str = "sess_fe5a1535-f557-4634-86bd-4dacaa18b989";
+    const SID: &str = "sess_00000000-0000-4000-8000-000000000001";
 
     fn store_with_session(root: &Path) -> KiroStore {
         let store = KiroStore::under(root);
