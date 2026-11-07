@@ -8,6 +8,9 @@ mod settings;
 mod theme;
 mod tray;
 
+#[cfg(test)]
+mod live_tests;
+
 use std::error::Error;
 
 use tauri::{ActivationPolicy, App, AppHandle, Emitter, Manager, RunEvent};
