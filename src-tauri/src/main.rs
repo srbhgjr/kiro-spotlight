@@ -8,6 +8,8 @@ mod cli;
 mod session;
 #[allow(dead_code)]
 mod settings;
+#[allow(dead_code)]
+mod theme;
 
 fn main() {
     tauri::Builder::default()
