@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Permissions for the Spotlight panel webview.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:window:allow-set-size",
+    "opener:allow-open-url"
+  ]
+}
