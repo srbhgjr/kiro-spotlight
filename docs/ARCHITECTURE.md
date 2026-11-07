@@ -1,6 +1,6 @@
 # Kiro Spotlight: Architecture Spec
 
-Version 0.1, 2026-11-07. Status: draft for review.
+Version 0.2, 2026-11-07. Status: draft for review.
 
 ## 1. Goal
 
@@ -17,7 +17,7 @@ Non-goals for v1: voice wake word, multi-window, chat history, file attachments 
 | Engine | `--agent-engine v2` (default). Allow v3 with `--auth-method cli` as a setting | v2 is the default and needs no extra auth plumbing |
 | Window | Real `NSPanel` via `tauri-nspanel` plugin, non-activating, floating level, joins all Spaces incl. fullscreen | Standard Spotlight behaviour; a plain NSWindow steals focus and does not overlay fullscreen apps |
 | Hotkey | `tauri-plugin-global-shortcut`, default Option+Space, user-configurable | Matches ChatGPT desktop default |
-| UI look | WebKit with native vibrancy (`NSVisualEffectView` material `hudWindow`/`popover`), SF Pro via `-apple-system`, system accent colour, system light/dark | Homogenous with macOS without SwiftUI |
+| UI look | macOS structure (NSPanel, vibrancy, SF Pro, Spotlight geometry) with colours taken from the user's selected Kiro theme, live-reloaded (section 6.1) | Feels native on macOS and consistent with Kiro |
 | Incognito | Ephemeral session: temp cwd, in-memory transcript, delete kiro-cli session records on close | kiro-cli persists sessions to disk; the app must undo that (section 7) |
 | Tool safety | Dedicated agent profile `kiro-spotlight` with read-only tools trusted; everything else prompts | A hotkey panel should not silently write files or run shell |
 | Front-end | TypeScript + Svelte (or React), Vite, no CSS framework; `marked` + `shiki` for Markdown/code | Keep the bundle small and styling hand-tuned to macOS |
@@ -64,7 +64,13 @@ src-tauri/
       protocol.rs      serde types for ACP messages (subset we use)
       client.rs        request/response correlation, notification dispatch, permission routing
     session.rs         ephemeral session lifecycle (temp cwd, ids, cleanup)
-    settings.rs        hotkey, agent, model, effort, engine, cleanup policy
+    settings.rs        hotkey, agent, model, effort, engine, cleanup policy, theme source
+    theme/
+      mod.rs           resolve active theme, emit theme-changed events
+      kiro_ide.rs      read Kiro IDE settings.json + theme extension JSON
+      kiro_crew.rs     read Kiro Crew config.json theme_color/theme_mode
+      palette.rs       map theme tokens to the app's CSS variable set
+      watch.rs         file watcher (notify crate) + system appearance observer
     cleanup.rs         deletes kiro-cli session artefacts for a session id
   tauri.conf.json
   capabilities/default.json
@@ -172,11 +178,56 @@ Details:
 - **Material**: panel background is transparent; Rust attaches an `NSVisualEffectView` (material `.hudWindow` in dark, `.popover` in light, blending `behindWindow`) so the panel blurs whatever is behind it like Spotlight.
 - **Shape**: 12 px corner radius on the panel; no title bar, no traffic lights, no resize handles (`decorations: false`, `resizable: false`, `transparent: true`).
 - **Typography**: `font-family: -apple-system, BlinkMacSystemFont`, 15 px body, 13 px secondary, SF Mono for code via `ui-monospace`.
-- **Colour**: text and separators use `color-scheme: light dark` plus the system palette through `-apple-system-*` CSS keywords (`-apple-system-label`, `-apple-system-secondary-label`, `-apple-system-separator`). Accent uses `AccentColor` from Rust (`NSColor.controlAccentColor`) pushed to CSS as `--accent`.
+- **Colour**: all colours come from the active Kiro theme (section 6.1) as CSS variables. The vibrancy material follows the theme's light/dark kind, and the theme background is applied at ~85% opacity over it so the blur still shows through. macOS system colours are used only when no Kiro theme can be resolved.
 - **Motion**: panel fades/scales in over 120 ms with `ease-out`, matching Spotlight; respects `prefers-reduced-motion`.
 - **Keyboard**: Esc hides; Cmd+, opens settings; Cmd+K clears the conversation (new session); Cmd+Shift+C copies the last answer; Up arrow recalls the last prompt within the current session only.
 - **Menu bar**: `NSStatusItem` with template icon, menu: Open (hotkey shown), New conversation, Settings, Quit. The app has no Dock icon (`LSUIElement = true`).
 - **Icons**: SF Symbols rendered through Rust (`NSImage(systemSymbolName:)` to PNG at launch) or a bundled subset of equivalent SVGs. No emoji anywhere in the UI.
+
+### 6.1 Following the Kiro theme
+
+The panel uses whatever theme the user picked in Kiro and switches live when they change it.
+
+**Sources, in resolution order** (configurable in settings as `theme_source`: `auto` | `kiro-ide` | `kiro-crew` | `system`; `auto` walks this list):
+
+| # | Source | Where | What is read |
+|---|---|---|---|
+| 1 | Kiro IDE | `~/Library/Application Support/Kiro/User/settings.json` (JSONC) | `workbench.colorTheme`; if `window.autoDetectColorScheme` is true, `workbench.preferredLightColorTheme` / `workbench.preferredDarkColorTheme` picked by current macOS appearance |
+| 2 | Kiro Crew | `~/.kiro/crew/config.json` | `theme_color` (e.g. `rosepine`) and `theme_mode` (`light` / `dark` / `system`) |
+| 3 | macOS | `NSApp.effectiveAppearance`, `NSColor.controlAccentColor` | system label, separator and accent colours |
+
+**Kiro IDE theme lookup** (`kiro_ide.rs`):
+
+1. Take the theme label, e.g. `Rosé Pine Dawn`.
+2. Scan `package.json` of each extension in `~/.kiro/extensions/*/` and of the built-in themes in `/Applications/Kiro.app/Contents/Resources/app/extensions/theme-*/` for a `contributes.themes[]` entry whose `label` (or `id`) matches.
+3. Load the referenced theme JSON (JSONC, may use `include` to chain a parent theme; follow it). `uiTheme` gives the kind: `vs` = light, `vs-dark` = dark, `hc-*` = high contrast.
+4. Read the `colors` map. Missing tokens fall back to the VS Code defaults for that kind.
+
+**Kiro Crew lookup** (`kiro_crew.rs`): a built-in table maps each Kiro Crew `theme_color` id to a light and a dark palette (Rosé Pine to Dawn/Main, and so on). `theme_mode: system` follows macOS appearance. Unknown ids fall through to macOS.
+
+**Token mapping** (`palette.rs`), VS Code token to CSS variable:
+
+| CSS variable | Primary token | Fallbacks |
+|---|---|---|
+| `--bg` | `editor.background` | `sideBar.background` |
+| `--fg` | `editor.foreground` | `foreground` |
+| `--fg-muted` | `descriptionForeground` | `--fg` at 65% |
+| `--accent` | `button.background` | `focusBorder` (opaque), `textLink.foreground` |
+| `--accent-fg` | `button.foreground` | `--bg` |
+| `--input-bg` | `input.background` | `--bg` |
+| `--border` | `widget.border` | `panel.border`, `--fg` at 12% |
+| `--link` | `textLink.foreground` | `--accent` |
+| `--error` | `errorForeground` | `editorError.foreground` |
+| `--code-bg` | `textCodeBlock.background` | `--input-bg` |
+| `--selection` | `editor.selectionBackground` | `--accent` at 25% |
+
+Colours with alpha (e.g. `#6e6a8614`, `#0000`) are composited over `--bg` before use so no token renders invisible. Contrast between `--fg` and `--bg` is checked (WCAG AA 4.5:1); on failure `--fg` falls back to the theme kind's default.
+
+**Syntax highlighting**: the same theme JSON's `tokenColors` is passed to `shiki` as a custom theme, so code blocks match the editor.
+
+**Live updates** (`watch.rs`): `notify` watches the two settings files and the resolved theme file; macOS appearance changes come from observing `AppleInterfaceThemeChangedNotification`. On change, Rust re-resolves (debounced 200 ms) and emits a `theme-changed` event with the full palette; the UI swaps CSS variables on `:root` with a 150 ms transition. The theme is also resolved once at launch and sent before the panel's first paint to avoid a flash.
+
+**Observed on this machine (2026-11-07)**: Kiro IDE `workbench.colorTheme` = `Rosé Pine Dawn` from extension `mvllow.rose-pine-2.15.2-universal` (`uiTheme: vs`, `editor.background #faf4ed`, `editor.foreground #575279`, `button.background #d7827e`); Kiro Crew `theme_color` = `rosepine`, `theme_mode` = `system`. Both sources agree on Rosé Pine; `auto` would pick the IDE's Dawn variant.
 
 ## 7. Incognito guarantees
 
@@ -224,7 +275,7 @@ Policy:
 
 ## 10. Settings (all non-conversational)
 
-hotkey, agent name (default `kiro-spotlight`), model, effort, engine (v2/v3), "hide on focus loss", "launch at login" (`tauri-plugin-autostart`), log level, `cli_path`.
+hotkey, agent name (default `kiro-spotlight`), model, effort, engine (v2/v3), theme source (`auto` / `kiro-ide` / `kiro-crew` / `system`), "hide on focus loss", "launch at login" (`tauri-plugin-autostart`), log level, `cli_path`.
 
 ## 11. Build, test, release
 
@@ -241,7 +292,7 @@ hotkey, agent name (default `kiro-spotlight`), model, effort, engine (v2/v3), "h
 | M0 | Spike | Hotkey toggles an NSPanel with vibrancy over a fullscreen app; `kiro-cli acp` answers one `session/prompt` from Rust and streams to the webview |
 | M1 | Incognito | Confirm which files and `data.sqlite3` tables kiro-cli writes under ACP; cleanup deletes them; test proves nothing remains |
 | M2 | Chat UX | Markdown streaming, tool-call rows, permission card, Stop, Cmd+K, error states |
-| M3 | Native polish | Light/dark, accent colour, SF Symbols, animations, menu bar, settings, hotkey recorder |
+| M3 | Native polish + Kiro theme | Kiro theme resolution and live reload, shiki theme from `tokenColors`, SF Symbols, animations, menu bar, settings, hotkey recorder |
 | M4 | Ship | Sign, notarise, DMG, launch-at-login, crash cleanup |
 
 ## 13. Open questions
